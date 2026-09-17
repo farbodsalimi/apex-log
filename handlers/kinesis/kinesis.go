@@ -1,42 +1,70 @@
+// Package kinesis implements a batching AWS Kinesis handler.
 package kinesis
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis"
+	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
+	"github.com/rogpeppe/fastuuid"
+	buffer "github.com/tj/go-buffer"
 
 	"github.com/apex/log"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/rogpeppe/fastuuid"
-	k "github.com/tj/go-kinesis"
 )
+
+// maxRecordsPerRequest is the Kinesis PutRecords hard limit.
+const maxRecordsPerRequest = 500
+
+// PutRecordsAPI abstracts the Kinesis PutRecords call for testing.
+type PutRecordsAPI interface {
+	PutRecords(ctx context.Context, in *kinesis.PutRecordsInput, opts ...func(*kinesis.Options)) (*kinesis.PutRecordsOutput, error)
+}
 
 // Handler implementation.
 type Handler struct {
-	appName  string
-	producer *k.Producer
-	gen      *fastuuid.Generator
+	stream string
+	client PutRecordsAPI
+	buffer *buffer.Buffer
+	gen    *fastuuid.Generator
 }
 
-// New handler sending logs to Kinesis. To configure producer options or pass your
-// own AWS Kinesis client use NewConfig instead.
+// New handler sending logs to Kinesis using the default AWS config.
 func New(stream string) *Handler {
-	return NewConfig(k.Config{
-		StreamName: stream,
-		Client:     kinesis.New(session.New(aws.NewConfig())),
-	})
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background())
+	if err != nil {
+		panic(fmt.Errorf("kinesis: load aws config: %w", err))
+	}
+	return NewWithClient(stream, kinesis.NewFromConfig(cfg))
 }
 
-// NewConfig handler sending logs to Kinesis. The `config` given is passed to the batch
-// Kinesis producer, and a random value is used as the partition key for even distribution.
-func NewConfig(config k.Config) *Handler {
-	producer := k.New(config)
-	producer.Start()
-	return &Handler{
-		producer: producer,
-		gen:      fastuuid.MustNewGenerator(),
+// NewWithConfig handler using the provided aws.Config.
+func NewWithConfig(stream string, cfg aws.Config) *Handler {
+	return NewWithClient(stream, kinesis.NewFromConfig(cfg))
+}
+
+// NewWithClient handler using the provided Kinesis client (or any type satisfying PutRecordsAPI).
+func NewWithClient(stream string, client PutRecordsAPI) *Handler {
+	h := &Handler{
+		stream: stream,
+		client: client,
+		gen:    fastuuid.MustNewGenerator(),
 	}
+	h.buffer = buffer.New(
+		buffer.WithMaxEntries(maxRecordsPerRequest),
+		buffer.WithFlushHandler(h.flush),
+	)
+	return h
+}
+
+// Close flushes pending records and stops the background flusher.
+func (h *Handler) Close() error {
+	h.buffer.Close()
+	return nil
 }
 
 // HandleLog implements log.Handler.
@@ -45,8 +73,24 @@ func (h *Handler) HandleLog(e *log.Entry) error {
 	if err != nil {
 		return err
 	}
-
 	uuid := h.gen.Next()
 	key := base64.StdEncoding.EncodeToString(uuid[:])
-	return h.producer.Put(b, key)
+	h.buffer.Push(types.PutRecordsRequestEntry{
+		Data:         b,
+		PartitionKey: aws.String(key),
+	})
+	return nil
+}
+
+// flush sends buffered records to Kinesis.
+func (h *Handler) flush(ctx context.Context, values []interface{}) error {
+	records := make([]types.PutRecordsRequestEntry, len(values))
+	for i, v := range values {
+		records[i] = v.(types.PutRecordsRequestEntry)
+	}
+	_, err := h.client.PutRecords(ctx, &kinesis.PutRecordsInput{
+		StreamName: aws.String(h.stream),
+		Records:    records,
+	})
+	return err
 }
